@@ -10,8 +10,7 @@ int mem_fd;
 void *gpio_map;
 volatile unsigned *gpio;
 
-
-#ifndef NOGPIO
+#if (!defined(NOGPIO) && !defined(SYSFS))
 //
 // Set up a memory regions to access GPIO
 //

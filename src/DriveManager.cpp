@@ -1,9 +1,17 @@
 #include "DriveManager.hpp"
 #include "gpio.hpp"
 #include <unistd.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+
 #define MAX_STEPS 80
 #define RESOLUTION 7200
 #define SEC_IN_NSEC (1000000000)
+
 DriveManager::DriveManager() : m_running(false)
 {}
 
@@ -14,6 +22,7 @@ DriveManager::DriveManager(DriveList drives) : m_running(false)
             drv != drives.end(); ++drv)
     {
         Drive d = {
+		0, 0,
             drv->direction_pin,
             drv->stepper_pin,
             0, -1, 0, true};
@@ -27,6 +36,15 @@ DriveManager::~DriveManager()
     if (!m_running) return;
     m_running = false;
     pthread_join(m_thread, NULL);
+
+#ifdef SYSFS
+    for (Drives::iterator d = m_drives.begin();
+         d != m_drives.end(); ++d) {
+	    gpioUnexport(d->direction_pin);
+	    gpioUnexport(d->stepper_pin);
+    }
+#endif
+
 }
 
 
@@ -61,6 +79,103 @@ static void _nop_delay(void)
 #pragma GCC pop_options
 #endif
 
+int DriveManager::gpioExport(int pin)
+{
+	int fd;
+	int ret = 0;
+	char pin_str[5];
+
+	if (gpioIsExported(pin))
+		return ret;
+
+	fd = open("/sys/class/gpio/export", O_WRONLY);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to export pin %d (errno: %d)\n",
+			pin, errno);
+		return -errno;
+	}
+
+	snprintf(pin_str, 5, "%d", pin);
+	if (write(fd, pin_str, strlen(pin_str)) < 0) {
+		fprintf(stderr, "Failed to export pin %d (errno: %d)\n",
+			pin, errno);
+		ret = -errno;
+	}
+	close(fd);
+
+	return ret;
+}
+
+int DriveManager::gpioUnexport(int pin)
+{
+	int fd;
+	int ret = 0;
+	char pin_str[5];
+
+	if (!gpioIsExported(pin))
+		return ret;
+
+	fd = open("/sys/class/gpio/unexport", O_WRONLY);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to export pin %d (errno: %d)\n",
+			pin, errno);
+		return -errno;
+	}
+
+	snprintf(pin_str, 5, "%d", pin);
+	if (write(fd, pin_str, strlen(pin_str)) < 0) {
+		fprintf(stderr, "Failed to unexport pin %d (errno: %d)\n",
+			pin, errno);
+		ret = -errno;
+	}
+	close(fd);
+
+	return ret;
+}
+
+int DriveManager::gpioIsExported(int pin)
+{
+	char buf[30];
+	snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d", pin);
+
+	if (access(buf, F_OK) != -1)
+		return 1;
+	return 0;
+}
+
+int DriveManager::gpioConfigure(int pin)
+{
+	int fd;
+	int ret = 0;
+	char buf[40];
+
+	snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", pin);
+	fd = open(buf, O_WRONLY);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to configure pin %d (errno: %d)\n",
+			pin, errno);
+		return -errno;
+	}
+	if (write(fd, "out", 3) < 0)
+		ret = -errno;
+	close(fd);
+
+	return ret;
+}
+
+int DriveManager::gpioOpenFd(int pin, int *fd)
+{
+	char buf[40];
+
+	snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/value", pin);
+	*fd = open(buf, O_WRONLY);
+	if (*fd < 0) {
+		fprintf(stderr, "Failed to open %s (errno: %d)\n", buf, errno);
+		return -errno;
+	}
+
+	return 0;
+}
 
 void DriveManager::setup()
 {
@@ -68,29 +183,58 @@ void DriveManager::setup()
     for (Drives::iterator d = m_drives.begin();
             d != m_drives.end(); ++d)
     {
+#ifdef SYSFS
+	    if (gpioExport(d->direction_pin) < 0 ||
+		gpioConfigure(d->direction_pin) < 0)
+		    return;
+	    if (gpioExport(d->stepper_pin) < 0 ||
+		gpioConfigure(d->stepper_pin) < 0)
+		    return;
+	    if (gpioOpenFd(d->direction_pin, &d->dir_fd) < 0)
+		    return;
+	    if (gpioOpenFd(d->stepper_pin, &d->step_fd) < 0)
+		    return;
+#else
         // Always use INP before OUT
         INP_GPIO(d->direction_pin);
         INP_GPIO(d->stepper_pin);
         OUT_GPIO(d->direction_pin);
         OUT_GPIO(d->stepper_pin);
-        
+#endif
         // "reseed" the drive
 #ifndef NOGPIO
+#ifdef SYSFS
+	write(d->dir_fd, "0", 1);
+#else
         GPIO_CLR = 1 << d->direction_pin;
+#endif
 #endif
         for (int i=0; i<MAX_STEPS; ++i)
         {
 #ifndef NOGPIO
+#ifdef SYSFS
+            write(d->step_fd, "1", 1);
+#else
             GPIO_SET = 1 << d->stepper_pin;
+#endif
 #ifndef FASTIO
             _nop_delay();
 #endif
+#ifdef SYSFS
+            write(d->step_fd, "0", 1);
+#else
             GPIO_CLR = 1 << d->stepper_pin;
+#endif
+
 #endif
             usleep(2500);
         }
 #ifndef NOGPIO
-        GPIO_SET = 1 << d->direction_pin;
+#ifdef SYSFS
+            write(d->dir_fd, "1", 1);
+#else
+            GPIO_SET = 1 << d->direction_pin;
+#endif
 #endif
     }
     pthread_mutex_init(&m_mutex, NULL);
@@ -124,23 +268,40 @@ void DriveManager::loop()
 #ifndef NOGPIO
                     if (d->direction)
                     {
+#ifdef SYSFS
+                        write(d->dir_fd, "1", 1);
+#else
                         GPIO_SET = 1 << d->direction_pin;
+#endif
                     }
                     else 
                     {
+#ifdef SYSFS
+                        write(d->dir_fd, "0", 1);
+#else
                         GPIO_CLR = 1 << d->direction_pin;
+#endif
                     }
 #endif
                     d->steps = 0;
                 }
                 // now send a pulse
 #ifndef NOGPIO
+#ifdef SYSFS
+                write(d->step_fd, "1", 1);
+#else
                 GPIO_SET = 1 << d->stepper_pin;
+#endif
 #ifndef FASTIO
                 // See definition of _nop_delay for more information
                 _nop_delay();
+		//usleep(50);
 #endif
+#ifdef SYSFS
+                write(d->step_fd, "0", 1);
+#else
                 GPIO_CLR = 1 << d->stepper_pin;
+#endif
 #endif
                 d->ticks = 0;
             }

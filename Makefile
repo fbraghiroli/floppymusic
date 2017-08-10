@@ -1,10 +1,12 @@
 CC=g++
 
 LD_FLAGS := -pthread
-CC_FLAGS := -O3 -Wno-unused-parameter -Wall -Wextra
+CC_FLAGS := -O3 -Wno-unused-parameter -Wno-unused-result -Wall -Wextra
 
 ifeq ($(MODEL),PI2)
 CC_FLAGS += -DPI_NEW_MODEL
+else ifeq ($(MODEL),SYSFS)
+CC_FLAGS += -DSYSFS
 endif
 
 export CC
